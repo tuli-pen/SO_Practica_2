@@ -31,7 +31,6 @@
 #include <sys/stat.h>
 #include <signal.h>
 
-#include "common.h"    /* FIFO_REQ, FIFO_RES, Request, Response */
 #include "index.h"
 #include "hash.h"
 
@@ -53,22 +52,311 @@ static int listen_fd = -1; // descriptor de archivo de socket que escucha
 static sem_t *sem = NULL; // inicializamos puntero al semáforo
 
 int build_index(const char *csv_path, const char *index_path);
+static void trim_inplace(char *s);
+
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+/* parse_csv_line_inplace: deja punteros dentro de tmp (que debes free) */
+int parse_csv_line_inplace(char *tmp, char *fields[], int max_fields) {
+    char *p = tmp;
+    int idx = 0;
+    while (*p && idx < max_fields) {
+        if (*p == '"') {
+            char *src = p + 1;
+            char *dst = p + 1;
+            fields[idx++] = dst;
+            while (*src) {
+                if (*src == '"') {
+                    if (src[1] == '"') { *dst++ = '"'; src += 2; }
+                    else { src++; break; }
+                } else *dst++ = *src++;
+            }
+            *dst = '\0';
+            while (*src && *src != ',') ++src;
+            if (*src == ',') ++src;
+            p = src;
+        } else {
+            fields[idx++] = p;
+            while (*p && *p != ',') ++p;
+            if (*p == ',') { *p = '\0'; ++p; }
+        }
+    }
+    return idx;
+}
+
+
+void debug_print_input(const char *str) {
+    if (!str) {
+        fprintf(stderr, "[DEBUG] ⚠️  Recibido puntero NULL\n");
+        return;
+    }
+
+    size_t len = strlen(str);
+    fprintf(stderr, "\n==================== DEBUG INPUT ====================\n");
+    fprintf(stderr, "[DEBUG] Cadena recibida (%zu bytes):\n", len);
+
+    // Muestra versión "legible"
+    fprintf(stderr, "TEXTO: \"");
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = str[i];
+        if (c == '\n') fprintf(stderr, "\\n");
+        else if (c == '\r') fprintf(stderr, "\\r");
+        else if (c == '\t') fprintf(stderr, "\\t");
+        else if (isprint(c)) fputc(c, stderr);
+        else fprintf(stderr, "\\x%02X", c);
+    }
+    fprintf(stderr, "\"\n");
+
+    // Muestra versión en HEX
+    fprintf(stderr, "HEX: ");
+    for (size_t i = 0; i < len; ++i) {
+        fprintf(stderr, "%02X ", (unsigned char)str[i]);
+    }
+    fprintf(stderr, "\n=====================================================\n\n");
+}
+
 
 // ============================================================================
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
+
+/* Mantén tus definiciones de IndexHeader, BucketDisk, EntryDisk y hash_string */
+
+/* Debug / robust write + index update */
+void append_and_reindex_bin2(
+    const char *csv_path,
+    const char *id,
+    const char *submitter,
+    const char *authors,
+    const char *title,
+    const char *abstract,
+    const char *categories,
+    const char *comments,
+    const char *journal_ref,
+    const char *doi,
+    const char *report_no,
+    const char *license,
+    const char *update_date,
+    const char *versions_count,
+    const char *versions_last_created
+) {
+    fprintf(stderr, "[CSV_DEBUG] csv_path='%s'\n", csv_path ? csv_path : "<NULL>");
+
+    /* 1) Abrir CSV en modo append binario (más claro para solo añadir) */
+    FILE *fcsv = fopen(csv_path, "ab+");
+    if (!fcsv) {
+        fprintf(stderr, "[CSV_DEBUG] fopen('%s') falló: %s\n", csv_path, strerror(errno));
+        return;
+    }
+
+    /* Obtener offset antes de escribir (seek al final) */
+    if (fseek(fcsv, 0, SEEK_END) != 0) {
+        fprintf(stderr, "[CSV_DEBUG] fseek(SEEK_END) fallo: %s\n", strerror(errno));
+        /* pero seguimos intentándolo */
+    }
+    long csv_offset = ftell(fcsv);
+    if (csv_offset == -1L) {
+        fprintf(stderr, "[CSV_DEBUG] ftell fallo: %s\n", strerror(errno));
+        csv_offset = 0;
+    }
+    fprintf(stderr, "[CSV_DEBUG] offset actual (start write) = %ld\n", csv_offset);
+
+    /* 2) Formar la línea CSV */
+    char line[8192];
+    int n = snprintf(line, sizeof(line),
+        "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n",
+        id ? id : "",
+        submitter ? submitter : "",
+        authors ? authors : "",
+        title ? title : "",
+        abstract ? abstract : "",
+        categories ? categories : "",
+        comments ? comments : "",
+        journal_ref ? journal_ref : "",
+        doi ? doi : "",
+        report_no ? report_no : "",
+        license ? license : "",
+        update_date ? update_date : "",
+        versions_count ? versions_count : "",
+        versions_last_created ? versions_last_created : ""
+    );
+
+    if (n < 0) {
+        fprintf(stderr, "[CSV_DEBUG] snprintf fallo\n");
+        fclose(fcsv);
+        return;
+    }
+    if ((size_t)n >= sizeof(line)) {
+        fprintf(stderr, "[CSV_DEBUG] AVISO: línea truncada (longitud necesaria=%d, buf=%zu)\n", n, sizeof(line));
+    }
+    size_t line_len = (size_t) (n < (int)sizeof(line) ? n : sizeof(line)-1);
+
+    /* Mostrar qué vamos a escribir (útil para detectar comillas extra, NULs, CR/LF) */
+    fprintf(stderr, "[CSV_DEBUG] LINE (len=%zu):\n", line_len);
+    /* imprime escapado para ver \n \r y \0 */
+    for (size_t i = 0; i < line_len; ++i) {
+        unsigned char c = (unsigned char)line[i];
+        if (c == '\n') fprintf(stderr, "\\n");
+        else if (c == '\r') fprintf(stderr, "\\r");
+        else if (c == '\t') fprintf(stderr, "\\t");
+        else if (c == '\0') fprintf(stderr, "\\0");
+        else fputc(c, stderr);
+    }
+    fprintf(stderr, "\n");
+
+    /* 3) Escribir y comprobar retorno */
+    size_t wrote = fwrite(line, 1, line_len, fcsv);
+    if (wrote != line_len) {
+        fprintf(stderr, "[CSV_DEBUG] fwrite escribió %zu/%zu bytes: %s\n", wrote, line_len, strerror(errno));
+        /* intentamos flush y seguir para no dejar inconsistencia */
+    } else {
+        fprintf(stderr, "[CSV_DEBUG] fwrite OK (%zu bytes)\n", wrote);
+    }
+
+    /* Asegurarnos que los buffers del stdio se vacíen y se sincronicen en disco */
+    if (fflush(fcsv) != 0) {
+        fprintf(stderr, "[CSV_DEBUG] fflush fallo: %s\n", strerror(errno));
+    } else {
+        /* fsync para forzar al kernel a persistir en disco (opcional pero útil para debug) */
+        int fd = fileno(fcsv);
+        if (fd >= 0) {
+            if (fsync(fd) != 0) {
+                fprintf(stderr, "[CSV_DEBUG] fsync fallo: %s\n", strerror(errno));
+            }
+        } else {
+            fprintf(stderr, "[CSV_DEBUG] fileno(fcsv) fallo\n");
+        }
+    }
+
+    /* Obtener nuevo tamaño del archivo (stat) para confirmar escritura */
+    struct stat st;
+    if (fstat(fileno(fcsv), &st) == 0) {
+        fprintf(stderr, "[CSV_DEBUG] tamaño de archivo tras escritura: %lld bytes\n", (long long)st.st_size);
+    } else {
+        fprintf(stderr, "[CSV_DEBUG] fstat fallo: %s\n", strerror(errno));
+    }
+
+    /* Cerrar CSV */
+    if (fclose(fcsv) != 0) {
+        fprintf(stderr, "[CSV_DEBUG] fclose fallo: %s\n", strerror(errno));
+    } else {
+        fprintf(stderr, "[CSV_DEBUG] CSV cerrado correctamente. offset inicial=%ld\n", csv_offset);
+    }
+
+    /* 4) ----------------- seguir con index.bin (no debería borrar lo escrito) ------------- */
+    FILE *findex = fopen("index.bin", "r+b");
+    if (!findex) {
+        fprintf(stderr, "[INDEX_DEBUG] No se pudo abrir index.bin: %s\n", strerror(errno));
+        /* NOTA: no retornamos aquí para no perder la info de que ya escribimos el CSV,
+           pero si la indexación es crítica podrías decidir manejarlo distinto. */
+        return;
+    }
+
+    IndexHeader header;
+    if (fread(&header, sizeof(IndexHeader), 1, findex) != 1) {
+        fprintf(stderr, "[INDEX_DEBUG] fread(header) fallo (o archivo vacio): %s\n", strerror(errno));
+        fclose(findex);
+        return;
+    }
+
+    unsigned long h = hash_string(title ? title : "");
+    int bucket_id = (header.n_buckets > 0) ? (h % header.n_buckets) : 0;
+    long bucket_offset = header.offset_buckets + bucket_id * sizeof(BucketDisk);
+
+    if (fseek(findex, bucket_offset, SEEK_SET) != 0) {
+        fprintf(stderr, "[INDEX_DEBUG] fseek(bucket) fallo: %s\n", strerror(errno));
+        fclose(findex);
+        return;
+    }
+
+    BucketDisk bucket;
+    if (fread(&bucket, sizeof(BucketDisk), 1, findex) != 1) {
+        fprintf(stderr, "[INDEX_DEBUG] fread(bucket) fallo: %s\n", strerror(errno));
+        fclose(findex);
+        return;
+    }
+
+    EntryDisk entry;
+    memset(&entry, 0, sizeof(EntryDisk));
+    strncpy(entry.key, title ? title : "", sizeof(entry.key)-1);
+    entry.csv_offset = csv_offset;
+    entry.next_entry = bucket.first_entry_offset;
+
+    if (fseek(findex, 0, SEEK_END) != 0) {
+        fprintf(stderr, "[INDEX_DEBUG] fseek(end) fallo: %s\n", strerror(errno));
+        fclose(findex);
+        return;
+    }
+    long new_entry_offset = ftell(findex);
+    if (new_entry_offset == -1L) {
+        fprintf(stderr, "[INDEX_DEBUG] ftell nuevo entry fallo: %s\n", strerror(errno));
+        fclose(findex);
+        return;
+    }
+
+    if (fwrite(&entry, sizeof(EntryDisk), 1, findex) != 1) {
+        fprintf(stderr, "[INDEX_DEBUG] fwrite(entry) fallo: %s\n", strerror(errno));
+        fclose(findex);
+        return;
+    }
+
+    /* actualizar bucket */
+    bucket.first_entry_offset = new_entry_offset;
+    if (fseek(findex, bucket_offset, SEEK_SET) != 0) {
+        fprintf(stderr, "[INDEX_DEBUG] fseek para escribir bucket fallo: %s\n", strerror(errno));
+        fclose(findex);
+        return;
+    }
+    if (fwrite(&bucket, sizeof(BucketDisk), 1, findex) != 1) {
+        fprintf(stderr, "[INDEX_DEBUG] fwrite(bucket) fallo: %s\n", strerror(errno));
+        fclose(findex);
+        return;
+    }
+
+    fclose(findex);
+    fprintf(stderr, "[INDEX_DEBUG] '%s' insertado en bucket %d (entry_offset=%ld)\n",
+           title ? title : "<NULL>", bucket_id, new_entry_offset);
+}
+
+
 
 // Guarda un nuevo registro en el CSV y reindexa después
 int save_new_register(const char *str) {
+    if (!str) return -1;
+    debug_print_input(str);
 
-    printf("Guardando %s...\n", str);
+    char *fields[14];
+    char *tmp = strdup(str);
+    if (!tmp) return -1;
 
-    // ############## AQUÍ VA EL CÓDIGO DE NICO #####################
+    int n = parse_csv_line_inplace(tmp, fields, 14);
+    for (int i = n; i < 14; ++i) fields[i] = NULL;
+    for (int i = 0; i < 14; ++i) {
+        if (fields[i]) trim_inplace(fields[i]);
+    }
+    /* debug */
+    for (int i = 0; i < 14; ++i) fprintf(stderr, "[FIELDS] %d: \"%s\"\n", i, fields[i] ? fields[i] : "<NULL>");
 
-    // Debe crear un nuevo registro con el titulo dado y luego reindexar
-
-    // Debe devolver 0 si guarda el nuevo registro exitosamente y -1 si tiene un error
-
+    append_and_reindex_bin2(
+        CSV_FILE,
+        fields[0], fields[1], fields[2], fields[3],
+        fields[4], fields[5], fields[6], fields[7],
+        fields[8], fields[9], fields[10], fields[11],
+        fields[12], fields[13]
+    );
+    free(tmp);
     return 0;
 }
+
+
 
 // ============================================================================
 

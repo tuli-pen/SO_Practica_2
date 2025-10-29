@@ -1,13 +1,12 @@
-CC=gcc
-CFLAGS=-Wall -Wextra -O2
+# Makefile simple para compilar los dos programas
 
-all: p2-searchd p2-dataProgram
+all: p2-search p2-dataProgram
 
-p2-searchd: src/p2-searchd.c src/common.h
-	$(CC) $(CFLAGS) -o p2-searchd src/p2-searchd.c -pthread
+p2-search: hash.c index2.c p2-search.c
+	gcc hash.c index2.c p2-search.c -o p2-search
 
-p2-dataProgram: src/p2-dataProgram.c src/common.h
-	$(CC) $(CFLAGS) -o p2-dataProgram src/p2-dataProgram.c -pthread
+p2-dataProgram: p2-dataProgram.c
+	gcc p2-dataProgram.c -o p2-dataProgram
 
 clean:
-	rm -f p2-searchd p2-dataProgram
+	rm -f p2-search p2-dataProgram

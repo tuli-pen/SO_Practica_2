@@ -21,7 +21,7 @@
 #define SERVER_IP      "127.0.0.1"
 #define SERVER_PORT    12345
 #define BACKLOG        16
-#define SEM_NAME       "/p2_so_ready_sem"
+#define SEM_NAME "/p2_so_ready_sem"
 
 #define MAX_LINE       4096
 #define MAX_REPLY      8192
